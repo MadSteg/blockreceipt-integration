@@ -1,0 +1,54 @@
+import 'dotenv/config';
+import express from 'express';
+import bodyParser from 'body-parser';
+import { Storage } from '@google-cloud/storage';
+import { ethers, BigNumber } from 'ethers';
+import { randomInt } from 'crypto';
+import { encryptJson } from '../scripts/lib/crypto.mjs';
+import { fileURLToPath } from 'url';
+import path from 'path';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const {
+  POLYGON_MAINNET_RPC_URL: RPC,
+  BLOCKCHAIN_PRIVATE_KEY: PK,
+  NFT_CONTRACT_ADDRESS: NFT_ADDR,
+  GOOGLE_APPLICATION_CREDENTIALS,
+  GCS_PROJECT_ID,
+  GCS_BUCKET,
+  WEBHOOK_API_KEY,
+  RECEIPT_AES_KEY,
+  NFT_BASE_URI,
+  MIN_TIP_GWEI = '35'
+} = process.env;
+
+if (!RPC || !PK || !NFT_ADDR || !GCS_PROJECT_ID || !GCS_BUCKET || !WEBHOOK_API_KEY || !RECEIPT_AES_KEY) {
+  console.error('Missing required envs. Check RPC/PK/NFT_ADDR/GCS_PROJECT_ID/GCS_BUCKET/WEBHOOK_API_KEY/RECEIPT_AES_KEY');
+  process.exit(1);
+}
+
+const storage = new Storage({
+  projectId: GCS_PROJECT_ID,
+  keyFilename: GOOGLE_APPLICATION_CREDENTIALS
+});
+const bucket = storage.bucket(GCS_BUCKET);
+
+function hexId(n) {
+  return BigInt(n).toString(16).padStart(64, '0');
+}
+function gcsPublicUrl(bucket, p) {
+  return `https://storage.googleapis.com/${encodeURIComponent(bucket)}/${encodeURI(p)}`;
+}
+function gwei(n){ return ethers.utils.parseUnits(String(n), 'gwei'); }
+
+
+
+function getMerchantName(req) {
+  const b = (req && req.body) ? req.body : {};
+  const m = b.merchantName ?? b.merchant ?? b.merchant_name ?? b.vendor ?? b.store ?? '';
+  return String(m || '');
+}
+
+
+async function pickMerchantImage(bucket, merchantOrName){const name=String(merchantOrName||"").toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"");const base=`https://storage.googleapis.com/${bucket}/merchants/${name}/images/`;const prefix=name.includes("dunkin")?(process.env.MERCHANT_PREFIX_DUNKIN||"dunkin"):name;const max=Number(process.env.MERCHANT_MAX_IMAGES||32);console.log("[picker] merchant:",merchantOrName,"slug:",name,"prefix:",prefix);for(let i=0;i<64;i++){const pick=1+Math.floor(Math.random()*Math.min(max,99));const nn=String(pick).padStart(2,"0");const url=`${base}${prefix}-${nn}.png`;try{const r=await fetch(url,{method:"GET"});console.log("[picker] try",url,"->",r.status);if(r.ok)return url;}catch(e){console.log("[picker] err",e?.message||e)}}throw new Error("No images found for merchant or fallback");});

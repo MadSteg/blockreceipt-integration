@@ -1,0 +1,154 @@
+import 'dotenv/config';
+import express from 'express';
+import crypto from 'crypto';
+import { Storage } from '@google-cloud/storage';
+import { ethers, BigNumber } from 'ethers';
+
+const RPC              = process.env.POLYGON_MAINNET_RPC_URL;
+const PK               = process.env.BLOCKCHAIN_PRIVATE_KEY;
+const NFT_ADDR         = process.env.NFT_CONTRACT_ADDRESS;
+const GCS_PROJECT_ID   = process.env.GCS_PROJECT_ID;
+const BUCKET           = process.env.GCS_BUCKET;
+const API_KEY          = process.env.WEBHOOK_API_KEY;
+const RECEIPT_AES_KEY  = process.env.RECEIPT_AES_KEY || null;
+
+if (!RPC || !PK || !NFT_ADDR || !GCS_PROJECT_ID || !BUCKET || !API_KEY) {
+  console.error('Missing required envs. Check RPC/PK/NFT_ADDR/GCS_PROJECT_ID/GCS_BUCKET/WEBHOOK_API_KEY');
+  process.exit(1);
+}
+
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+
+const storage = new Storage({ projectId: GCS_PROJECT_ID });
+const bucket  = storage.bucket(BUCKET);
+
+function gwei(n){ return ethers.utils.parseUnits(String(n),'gwei'); }
+
+async function pickMerchantImageV2(bucketName, merchantOrName) {
+  const name = String(merchantOrName || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  const base   = `https://storage.googleapis.com/${bucketName}/merchants/${name}/images/`;
+  const prefix = name.includes("dunkin")
+    ? (process.env.MERCHANT_PREFIX_DUNKIN || "dunkin")
+    : name;
+  const max    = Number(process.env.MERCHANT_MAX_IMAGES || 32);
+
+  console.log("[picker:v2]", { merchantOrName, slug: name, prefix, max });
+
+  for (let tries = 0; tries < 64; tries++) {
+    const n  = 1 + Math.floor(Math.random() * Math.min(max, 99));
+    const nn = String(n).padStart(2, "0");
+    const url = `${base}${prefix}-${nn}.png`;
+    try {
+      const r = await fetch(url, { method: "GET" });
+      console.log("[picker:v2] probe", url, "->", r.status);
+      if (r.ok) return url;
+    } catch (e) {
+      console.log("[picker:v2] error", e?.message || e);
+    }
+  }
+  throw new Error("No images found for merchant or fallback");
+}
+
+function hex32(n){
+  const bn = BigNumber.from(n);
+  return bn.toHexString().replace(/^0x/,"").padStart(64,'0');
+}
+
+function encryptReceipt(jsonStr) {
+  if (!RECEIPT_AES_KEY) return null;
+  const key = Buffer.from(RECEIPT_AES_KEY, 'hex');
+  const iv  = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const enc = Buffer.concat([cipher.update(jsonStr, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([Buffer.from('01','hex'), iv, tag, enc]).toString('base64');
+}
+
+app.post('/pos/mint', async (req, res) => {
+  try {
+    if (req.get('x-api-key') !== API_KEY) {
+      return res.status(401).json({ ok:false, error:'Unauthorized' });
+    }
+
+    const body = req.body || {};
+    const tokenId = Number(body.tokenId);
+    const to      = String(body.to || '').trim();
+    const merchantName = body.merchantName || body.merchant || 'Unknown Merchant';
+
+    if (!Number.isFinite(tokenId)) return res.status(400).json({ ok:false, error:'Bad tokenId' });
+    if (!to || !to.startsWith('0x') || to.length !== 42) return res.status(400).json({ ok:false, error:'Bad recipient' });
+
+    const imageUrl = await pickMerchantImageV2(BUCKET, merchantName);
+
+    const encPayload = encryptReceipt(JSON.stringify({
+      merchantName,
+      totalCents: body.totalCents,
+      items: body.items,
+      paymentLast4: body.paymentLast4,
+      ts: body.timestamp || Math.floor(Date.now()/1000)
+    }));
+
+    const meta = {
+      name: `BlockReceipt #${tokenId}`,
+      description: `Receipt from ${merchantName}`,
+      image: imageUrl,
+      external_url: "https://blockreceipt.example",
+      attributes: [
+        { trait_type: "Merchant", value: merchantName },
+        { trait_type: "TotalCents", value: Number(body.totalCents || 0) },
+        { trait_type: "Timestamp", value: Number(body.timestamp || Math.floor(Date.now()/1000)) }
+      ],
+      encrypted_data: encPayload || undefined
+    };
+
+    const idHex = hex32(tokenId);
+    const path  = `metadata/${idHex}.json`;
+
+    const file = bucket.file(path);
+    await file.save(JSON.stringify(meta, null, 2), {
+      contentType: 'application/json',
+      resumable: false
+    });
+    try { await file.makePublic(); } catch(_) {}
+
+    const metaUrl = `https://storage.googleapis.com/${BUCKET}/${path}`;
+
+    const provider = new ethers.providers.JsonRpcProvider(RPC, { chainId:137, name:'polygon' });
+    const signer   = new ethers.Wallet(PK, provider);
+    const abi = ['function mint(address to, uint256 id, uint256 amount, bytes data) external'];
+    const nft = new ethers.Contract(NFT_ADDR, abi, signer);
+
+    const fd  = await provider.getFeeData();
+    const tip = BigNumber.from(fd.maxPriorityFeePerGas || gwei(2)).lt(gwei(40)) ? gwei(40) : (fd.maxPriorityFeePerGas || gwei(40));
+    const max = BigNumber.from(fd.maxFeePerGas || (await provider.getGasPrice())).mul(2).add(tip);
+
+    const tx = await nft.mint(to, tokenId, 1, '0x', {
+      gasLimit: 220000,
+      maxPriorityFeePerGas: tip,
+      maxFeePerGas: max
+    });
+    const r  = await tx.wait();
+
+    res.json({
+      ok: true,
+      tokenId,
+      to,
+      merchantName,
+      metadata: metaUrl,
+      image: imageUrl,
+      txHash: tx.hash,
+      blockNumber: r.blockNumber
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok:false, error: e?.message || String(e) });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`POS webhook listening on :${PORT}`));
