@@ -1,0 +1,42 @@
+{
+  "version": "1.0.0",
+  "lastSync": "2025-10-17T08:49:27Z",
+  "components": {
+    "backend": {
+      "path": "./backend/",
+      "status": "ready",
+      "features": [
+        "DALL-E 3 Integration",
+        "Cloudflare R2 Storage",
+        "Blockchain Minting",
+        "Privacy Service",
+        "POS Integration",
+        "NFT Procurement"
+      ]
+    },
+    "mobile": {
+      "path": "./mobile/",
+      "status": "ready",
+      "features": [
+        "React Native App",
+        "Modern UI/UX",
+        "API Integration",
+        "Cloudflare Service"
+      ]
+    },
+    "frontend": {
+      "path": "./frontend/",
+      "status": "ready",
+      "features": [
+        "Web Components",
+        "User Interface",
+        "API Integration"
+      ]
+    }
+  },
+  "deployment": {
+    "target": "replit",
+    "url": "https://block-receiptai-stevendonoghue.replit.app",
+    "status": "ready"
+  }
+}

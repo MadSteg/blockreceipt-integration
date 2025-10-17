@@ -1,0 +1,189 @@
+import 'dotenv/config';
+import express from 'express';
+import bodyParser from 'body-parser';
+import { Storage } from '@google-cloud/storage';
+import { ethers, BigNumber } from 'ethers';
+import { randomInt } from 'crypto';
+import { encryptJson } from '../scripts/lib/crypto.mjs';
+import { fileURLToPath } from 'url';
+import path from 'path';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const {
+  POLYGON_MAINNET_RPC_URL: RPC,
+  BLOCKCHAIN_PRIVATE_KEY: PK,
+  NFT_CONTRACT_ADDRESS: NFT_ADDR,
+  GOOGLE_APPLICATION_CREDENTIALS,
+  GCS_PROJECT_ID,
+  GCS_BUCKET,
+  WEBHOOK_API_KEY,
+  RECEIPT_AES_KEY,
+  NFT_BASE_URI,
+  MIN_TIP_GWEI = '35'
+} = process.env;
+
+if (!RPC || !PK || !NFT_ADDR || !GCS_PROJECT_ID || !GCS_BUCKET || !WEBHOOK_API_KEY || !RECEIPT_AES_KEY) {
+  console.error('Missing required envs. Check RPC/PK/NFT_ADDR/GCS_PROJECT_ID/GCS_BUCKET/WEBHOOK_API_KEY/RECEIPT_AES_KEY');
+  process.exit(1);
+}
+
+const storage = new Storage({
+  projectId: GCS_PROJECT_ID,
+  keyFilename: GOOGLE_APPLICATION_CREDENTIALS
+});
+const bucket = storage.bucket(GCS_BUCKET);
+
+function hexId(n) {
+  return BigInt(n).toString(16).padStart(64, '0');
+}
+function gcsPublicUrl(bucket, p) {
+  return `https://storage.googleapis.com/${encodeURIComponent(bucket)}/${encodeURI(p)}`;
+}
+function gwei(n){ return ethers.utils.parseUnits(String(n), 'gwei'); }
+
+
+async function pickMerchantImage(bucket, merchantName) {
+  const slug = merchantName.toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  // image counts per merchant (override via env)
+  const counts = {
+    "dunkin-donuts": Number(process.env.MERCHANT_IMAGES_DUNKIN || 9),
+    "cvs": Number(process.env.MERCHANT_IMAGES_CVS || 0),
+    "nike": Number(process.env.MERCHANT_IMAGES_NIKE || 0)
+  };
+
+  // filename prefix per merchant (override via env)
+  const prefixes = {
+    "dunkin-donuts": process.env.MERCHANT_PREFIX_DUNKIN || "dunkin-donuts",
+    "cvs": process.env.MERCHANT_PREFIX_CVS || "cvs",
+    "nike": process.env.MERCHANT_PREFIX_NIKE || "nike"
+  };
+
+  const count = counts[slug] || 0;
+  const prefix = prefixes[slug] || slug;
+
+  if (count > 0) {
+    const idx = Math.floor(Math.random() * count) + 1; // 1..count
+    const nn = String(idx).padStart(2, "0");
+    return `https://storage.googleapis.com/${bucket}/merchants/${slug}/images/${prefix}-${nn}.png`;
+  }
+
+  const fallbackCount = Number(process.env.MERCHANT_IMAGES_FALLBACK || 0);
+  if (fallbackCount > 0) {
+    const idx = Math.floor(Math.random() * fallbackCount) + 1;
+    const nn = String(idx).padStart(2, "0");
+    return `https://storage.googleapis.com/${bucket}/images/fallback-${nn}.png`;
+  }
+
+  throw new Error("No images found for merchant or fallback");
+}
+
+
+const app = express();
+app.use(bodyParser.json());
+
+app.post('/pos/mint', async (req, res) => {
+  try {
+    if (req.header('x-api-key') !== WEBHOOK_API_KEY) return res.status(401).json({ ok:false, error:'unauthorized' });
+
+    const {
+      tokenId,
+      to,
+      merchantName = 'Unknown Merchant',
+      totalCents,
+      items = [],                          // [{desc, qty, unitCents}]
+      paymentLast4 = '',
+      timestamp = Math.floor(Date.now()/1000)
+    } = req.body;
+
+    if (typeof tokenId !== 'number' || !to) {
+      return res.status(400).json({ ok:false, error:'tokenId (number) and to (address) required' });
+    }
+
+    // 1) choose an image for this merchant
+    const imageUrl = await pickMerchantImage(merchantName);
+
+    // 2) build PRIVATE payload and encrypt
+    const privateReceipt = {
+      merchantName,
+      timestamp,
+      currency: 'USD',
+      items,                // [{desc, qty, unitCents}]
+      totalCents,
+      payment: { method: 'card', last4: paymentLast4 },
+      version: 1
+    };
+    const enc = encryptJson(privateReceipt, RECEIPT_AES_KEY);
+
+    // 3) upload encrypted private JSON
+    const idHex = hexId(tokenId);
+    const privatePath = `private/${idHex}.json.enc`;
+    await bucket.file(privatePath).save(JSON.stringify(enc), {
+      resumable: false,
+      contentType: 'application/json'
+    });
+    const privateUrl = gcsPublicUrl(GCS_BUCKET, privatePath);
+
+    // 4) write PUBLIC metadata (minimal, with pointers)
+    const meta = {
+      name: `BlockReceipt #${tokenId}`,
+      description: 'BlockReceipt: encrypted receipt. Viewable by token owner.',
+      image: imageUrl,
+      external_url: 'https://www.blockreceipt.ai',
+      attributes: [
+        { trait_type: 'Merchant', value: merchantName },
+        { trait_type: 'Total (USD)', value: (totalCents/100).toFixed(2) },
+        { trait_type: 'Timestamp', value: timestamp }
+      ],
+      encryption: {
+        enc_url: privateUrl,
+        enc_alg: enc.alg
+      }
+    };
+    const metaPath = `metadata/${idHex}.json`;
+    await bucket.file(metaPath).save(JSON.stringify(meta, null, 2), {
+      resumable: false,
+      contentType: 'application/json'
+    });
+    const metaUrl = gcsPublicUrl(GCS_BUCKET, metaPath);
+
+    // 5) mint (same fee handling you used)
+    const provider = new ethers.providers.JsonRpcProvider(RPC, { chainId: 137, name: 'polygon' });
+    const signer   = new ethers.Wallet(PK, provider);
+    const abi = ['function mint(address to, uint256 id, uint256 amount, bytes data) external'];
+    const nft = new ethers.Contract(NFT_ADDR, abi, signer);
+
+    const fd  = await provider.getFeeData();
+    const tip = BigNumber.from(fd.maxPriorityFeePerGas || gwei(2)).lt(gwei(MIN_TIP_GWEI)) ? gwei(MIN_TIP_GWEI) : (fd.maxPriorityFeePerGas || gwei(MIN_TIP_GWEI));
+    const max = BigNumber.from(fd.maxFeePerGas || (await provider.getGasPrice())).mul(2).add(tip);
+
+    const tx = await nft.mint(to, tokenId, 1, '0x', {
+      gasLimit: 220000,
+      maxPriorityFeePerGas: tip,
+      maxFeePerGas: max
+    });
+    const rc = await tx.wait();
+
+    return res.json({
+      ok: true,
+      tokenId,
+      to,
+      merchantName,
+      metadata: metaUrl,
+      image: imageUrl,
+      txHash: tx.hash,
+      blockNumber: rc.blockNumber
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok:false, error: e.message || String(e) });
+  }
+});
+
+const port = Number(process.env.PORT || 3000);
+app.listen(port, () => {
+  console.log(`POS webhook listening on :${port}`);
+});
